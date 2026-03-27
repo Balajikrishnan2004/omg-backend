@@ -1,5 +1,14 @@
-import { PubSub, reportInfo } from 'node-server-engine';
+import { PubSub, reportInfo, reportError } from 'node-server-engine';
 import { handleSampleMessage } from './handlers';
+
+let retryTimer: NodeJS.Timeout | null = null;
+
+function schedulePubSubRetry(attemptNumber: number): void {
+  // Exponential backoff: 30s, 60s, 120s, 240s, capped at 300s
+  const delayMs = Math.min(30000 * Math.pow(2, attemptNumber - 1), 300000);
+  reportInfo(`Scheduling Pub/Sub retry attempt ${attemptNumber + 1} in ${delayMs / 1000}s`);
+  retryTimer = setTimeout(() => initPubSub(attemptNumber + 1), delayMs);
+}
 
 /**
  * Initialize Pub/Sub publishers and subscribers
@@ -7,7 +16,7 @@ import { handleSampleMessage } from './handlers';
  * This function sets up all Pub/Sub topics (publishers) and subscriptions (subscribers)
  * needed by the service. It should be called after the HTTP server is initialized.
  */
-export async function initPubSub(): Promise<void> {
+export async function initPubSub(attemptNumber = 0): Promise<void> {
   // Check if Pub/Sub is enabled via environment variable
   if (process.env.ENABLE_PUBSUB?.toLowerCase() !== 'true') {
     reportInfo('Pub/Sub disabled (ENABLE_PUBSUB not set to true)');
@@ -21,37 +30,44 @@ export async function initPubSub(): Promise<void> {
     return;
   }
 
-  reportInfo('Initializing Pub/Sub...');
-
-  // Register publishers (topics to publish to)
-  // Add a publisher for each topic you want to publish messages to
-  if (process.env.PUBSUB_TOPIC) {
-    PubSub.addPublisher(process.env.PUBSUB_TOPIC);
-    reportInfo(`Registered publisher: ${process.env.PUBSUB_TOPIC}`);
+  if (retryTimer) {
+    clearTimeout(retryTimer);
+    retryTimer = null;
   }
 
-  // Register additional publishers as needed
-  // PubSub.addPublisher(process.env.PUBSUB_EVENT_TOPIC);
-  // PubSub.addPublisher(process.env.PUBSUB_NOTIFICATION_TOPIC);
+  reportInfo(`Initializing Pub/Sub (attempt ${attemptNumber + 1})...`);
 
-  // Register subscribers (subscriptions to listen to)
-  // Add a subscriber for each subscription you want to process messages from
-  if (process.env.PUBSUB_SUBSCRIPTION) {
-    PubSub.addSubscriber(
-      process.env.PUBSUB_SUBSCRIPTION,
-      handleSampleMessage
-    );
-    reportInfo(`Registered subscriber: ${process.env.PUBSUB_SUBSCRIPTION}`);
+  try {
+    // Register publishers (topics to publish to)
+    if (process.env.PUBSUB_TOPIC) {
+      PubSub.addPublisher(process.env.PUBSUB_TOPIC);
+      reportInfo(`Registered publisher: ${process.env.PUBSUB_TOPIC}`);
+    }
+
+    // Register subscribers (subscriptions to listen to)
+    if (process.env.PUBSUB_SUBSCRIPTION) {
+      PubSub.addSubscriber(
+        process.env.PUBSUB_SUBSCRIPTION,
+        handleSampleMessage
+      );
+      reportInfo(`Registered subscriber: ${process.env.PUBSUB_SUBSCRIPTION}`);
+    }
+
+    // Initialize all Pub/Sub connections
+    await PubSub.init();
+
+    reportInfo('Pub/Sub initialized successfully');
+  } catch (error) {
+    reportError({
+      namespace: 'node-server-template:pubsub:init',
+      message: `Failed to initialize Pub/Sub (attempt ${attemptNumber + 1})`,
+      error: {
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined
+      }
+    });
+
+    // Schedule background retry - service continues with HTTP fallback
+    schedulePubSubRetry(attemptNumber);
   }
-
-  // Register additional subscribers with different handlers
-  // PubSub.addSubscriber(
-  //   process.env.PUBSUB_ANOTHER_SUBSCRIPTION,
-  //   handleAnotherMessageType
-  // );
-
-  // Initialize all Pub/Sub connections
-  await PubSub.init();
-
-  reportInfo('Pub/Sub initialized successfully');
 }
